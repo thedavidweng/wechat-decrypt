@@ -113,7 +113,7 @@ def main():
     # 加载密钥
     if not os.path.exists(KEYS_FILE):
         print(f"[ERROR] 密钥文件不存在: {KEYS_FILE}")
-        print("请先运行 find_all_keys.py")
+        print("请先运行 python main.py decrypt 提取密钥并解密")
         sys.exit(1)
 
     with open(KEYS_FILE, encoding="utf-8") as f:
@@ -146,7 +146,7 @@ def main():
     for rel, path, sz in db_files:
         key_info = get_key_info(keys, rel)
         if not key_info:
-            print(f"SKIP: {rel} (无密钥)")
+            print(f"SKIP: {rel} (无密钥，如已安装微信补丁可能需要重新运行密钥提取)")
             skipped += 1
             continue
 
