@@ -29,6 +29,13 @@ from contextlib import closing
 from datetime import datetime
 
 import mcp_server
+
+# 尝试导入 tqdm 作为进度条（可选）
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    _tqdm = None
+
 from chat_export_helpers import _extract_content, _msg_type_str, _resolve_sender
 
 
@@ -215,7 +222,9 @@ def main():
 
     t0 = time.time()
     ok, skip, err, total = 0, 0, 0, 0
-    for i, username in enumerate(sessions, 1):
+
+    iterable = _tqdm(sessions, desc="导出进度") if _tqdm else sessions
+    for i, username in enumerate(iterable, 1):
         display = names.get(username, username)
         success, count, reason = export_one(
             username, output_dir, names, transcribe=args.with_transcriptions
@@ -223,21 +232,26 @@ def main():
         if success:
             ok += 1
             total += count
-            if i <= 10 or i % 100 == 0:
-                elapsed = time.time() - t0
-                eta = (elapsed / i) * (len(sessions) - i) if i > 0 else 0
-                print(
-                    f"[{i}/{len(sessions)}] {display} - {count} 条消息"
-                    + (f"  ETA {eta/60:.0f}分" if i > 1 else "")
-                )
+            if not _tqdm:
+                if i <= 10 or i % 100 == 0:
+                    elapsed = time.time() - t0
+                    eta = (elapsed / i) * (len(sessions) - i) if i > 0 else 0
+                    print(
+                        f"[{i}/{len(sessions)}] {display} - {count} 条消息"
+                        + (f"  ETA {eta/60:.0f}分" if i > 1 else "")
+                    )
         else:
             if "no tables" in str(reason) or "empty" in str(reason):
                 skip += 1
-                if i <= 10 or i % 50 == 0:
-                    print(f"[{i}/{len(sessions)}] {display} - 跳过({reason})")
+                if not _tqdm:
+                    if i <= 10 or i % 50 == 0:
+                        print(f"[{i}/{len(sessions)}] {display} - 跳过({reason})")
             else:
                 err += 1
-                print(f"[{i}/{len(sessions)}] {display} - 失败: {reason}")
+                if not _tqdm:
+                    print(f"[{i}/{len(sessions)}] {display} - 失败: {reason}")
+                elif _tqdm:
+                    _tqdm.write(f"失败: {display} - {reason}")
 
     elapsed = time.time() - t0
     print()
