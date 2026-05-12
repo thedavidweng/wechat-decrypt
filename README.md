@@ -1,6 +1,6 @@
 # WeChat 4.x Database Decryptor
 
-微信 4.0 (Windows / macOS / Linux) 本地数据库解密工具。从运行中的微信进程内存提取加密密钥，解密所有 SQLCipher 4 加密数据库，并提供实时消息监听、AI 查询、批量导出和语音转录。
+微信 4.0 (Windows / macOS / Linux) 本地数据库解密工具。从运行中的微信进程内存提取加密密钥，解密所有 SQLCipher 4 加密数据库，并提供实时消息监听、MCP Server、批量导出和语音转录。
 
 ---
 
