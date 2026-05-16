@@ -32,3 +32,8 @@ Thumbs.db
 find_all_keys_macos
 decoded_voices/
 voice_transcriptions.json
+
+# Sensitive/temp local files
+*_keys*.json
+exported_chats/
+tmp_*.py
