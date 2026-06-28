@@ -172,8 +172,7 @@ python3 export_all_chats.py
 - [macOS 4.1.9](https://archive.org/details/wechat-mac-4.1.9) — `WeChatMac_4.1.9.dmg`
 - [Windows 4.1.9](https://archive.org/details/wechat-win-4.1.9) — `WeChatWin_4.1.11.exe`
 
-> 以上为腾讯专有软件的历史版本备份，仅供在个人设备上提取密钥使用。
-> 本项目不分发微信安装包或 DLL。详见 [#125](https://github.com/ylytdeng/wechat-decrypt/issues/125)（Windows）、[#143](https://github.com/ylytdeng/wechat-decrypt/issues/143)（macOS）。
+> 腾讯专有软件，仅供个人设备提取密钥；本项目不分发安装包或 DLL。
 
 </details>
 
