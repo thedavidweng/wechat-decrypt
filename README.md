@@ -150,6 +150,31 @@ python3 export_all_chats.py
 - root 权限或 `CAP_SYS_PTRACE`
 - 微信正在运行
 
+<details>
+<summary>⚠️ 微信版本兼容性（4.1.10+ 密钥提取限制）</summary>
+
+| 版本 | 密钥提取 | 说明 |
+|------|----------|------|
+| ≤ 4.1.9.x | ✅ 正常 | 推荐在此版本提取 key |
+| 4.1.10+ (Windows) | ❌ 内存扫描失效 | 详见 [#125](https://github.com/ylytdeng/wechat-decrypt/issues/125) |
+| 已有 `all_keys.json` | ✅ 不受影响 | 4.1.9 提取的 key 可解密 4.1.10 数据库 |
+
+**全新安装 4.1.10+ 且尚未提取 key 的用户**：
+
+1. 安装 4.1.9，登录后运行密钥提取
+2. 升级到 4.1.10+（选择「保留聊天记录」）
+3. 用已有 key 继续解密 / 导出 / 监控
+
+4.1.9 安装包归档（第三方备份，请自行校验 checksum）：
+
+- [macOS 4.1.9](https://archive.org/details/wechat-mac-4.1.9) — `WeChatMac_4.1.9.dmg`
+- [Windows 4.1.9](https://archive.org/details/wechat-win-4.1.9) — `WeChatWin_4.1.11.exe`
+
+> 以上为腾讯专有软件的历史版本备份，仅供在个人设备上提取密钥使用。
+> 本项目不分发微信安装包或 DLL。详见 [#125](https://github.com/ylytdeng/wechat-decrypt/issues/125)。
+
+</details>
+
 ### 安装依赖
 
 ```bash
