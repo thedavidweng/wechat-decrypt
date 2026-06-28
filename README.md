@@ -153,10 +153,12 @@ python3 export_all_chats.py
 <details>
 <summary>⚠️ 微信版本兼容性（4.1.10+ 密钥提取限制）</summary>
 
+4.1.10 起微信不再把 SQLCipher key 以可扫描形态留在内存（用完即擦），Windows 与 macOS 行为一致。
+
 | 版本 | 密钥提取 | 说明 |
 |------|----------|------|
 | ≤ 4.1.9.x | ✅ 正常 | 推荐在此版本提取 key |
-| 4.1.10+ (Windows) | ❌ 内存扫描失效 | 详见 [#125](https://github.com/ylytdeng/wechat-decrypt/issues/125) |
+| 4.1.10+ | ❌ 内存扫描失效 | Windows [#125](https://github.com/ylytdeng/wechat-decrypt/issues/125)、macOS [#143](https://github.com/ylytdeng/wechat-decrypt/issues/143) |
 | 已有 `all_keys.json` | ✅ 不受影响 | 4.1.9 提取的 key 可解密 4.1.10 数据库 |
 
 **全新安装 4.1.10+ 且尚未提取 key 的用户**：
@@ -171,7 +173,7 @@ python3 export_all_chats.py
 - [Windows 4.1.9](https://archive.org/details/wechat-win-4.1.9) — `WeChatWin_4.1.11.exe`
 
 > 以上为腾讯专有软件的历史版本备份，仅供在个人设备上提取密钥使用。
-> 本项目不分发微信安装包或 DLL。详见 [#125](https://github.com/ylytdeng/wechat-decrypt/issues/125)。
+> 本项目不分发微信安装包或 DLL。详见 [#125](https://github.com/ylytdeng/wechat-decrypt/issues/125)（Windows）、[#143](https://github.com/ylytdeng/wechat-decrypt/issues/143)（macOS）。
 
 </details>
 
