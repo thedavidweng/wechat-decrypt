@@ -22,6 +22,12 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from config import load_config
+from decode_image import (
+    find_dat_files,
+    select_best_dat_path,
+    download_image_from_message_xml,
+    write_decoded_image_bytes,
+)
 
 _cfg = load_config()
 MSG_DB_DIR = os.path.join(_cfg["decrypted_dir"], "message")
@@ -35,6 +41,7 @@ MSGATTACH_DIR = _cfg.get("msgattach_dir", "")  # WeChat Files/FileStorage/MsgAtt
 IMAGE_AES_KEY = _cfg.get("image_aes_key")
 IMAGE_XOR_KEY = _cfg.get("image_xor_key", 0x88)
 MSG_RESOURCE_DB = os.path.join(_cfg["decrypted_dir"], "message", "message_resource.db")
+HARDLINK_DB = os.path.join(_cfg["decrypted_dir"], "hardlink", "hardlink.db")
 
 _CONTACT_FILTER = None
 _filter_raw = os.environ.get("WECHAT_EXPORT_CONTACTS", "").strip()
@@ -110,43 +117,18 @@ def _load_resource_md5_map():
     return md5_map
 
 
-def _find_dat_file(username_hash, file_md5):
-    """在 attach / MsgAttach 目录下查找 .dat 文件，优先高清版"""
-    search_patterns = []
-    # xwechat_files 的 msg/attach 目录: <hash>/<YYYY-MM>/Img/<md5>*.dat
-    if ATTACH_DIR and os.path.isdir(ATTACH_DIR):
-        search_base = os.path.join(ATTACH_DIR, username_hash)
-        if os.path.isdir(search_base):
-            search_patterns.append(os.path.join(search_base, "*", "Img", f"{file_md5}*.dat"))
-    # WeChat Files 的 MsgAttach 目录: <hash>/Image/<YYYY-MM>/<md5>*.dat
-    if MSGATTACH_DIR and os.path.isdir(MSGATTACH_DIR):
-        search_base = os.path.join(MSGATTACH_DIR, username_hash)
-        if os.path.isdir(search_base):
-            search_patterns.append(os.path.join(search_base, "Image", "*", f"{file_md5}*.dat"))
-
-    files = []
-    for pat in search_patterns:
-        files.extend(glob.glob(pat))
-    if not files:
-        return None
-    # 优先: 无后缀(原图) > _W(原图) > _h(高清) > _t/_t_W(缩略图)
-    # 先过滤掉缩略图
-    non_thumb = [f for f in files if '_t.' not in os.path.basename(f) and '_t_' not in os.path.basename(f)]
-    candidates = non_thumb if non_thumb else files
-    selected = candidates[0]
-    for f in candidates:
-        fname = os.path.basename(f)
-        # 精确匹配原图（无后缀）
-        if fname == f"{file_md5}.dat":
-            return f
-    for f in candidates:
-        fname = os.path.basename(f)
-        if fname == f"{file_md5}_W.dat":
-            return f
-    for f in candidates:
-        if '_h.' in os.path.basename(f) or '_h_' in os.path.basename(f):
-            return f
-    return selected
+def _find_dat_file(username, file_md5):
+    """在 hardlink / attach / MsgAttach 下查找 .dat，优先高清版。"""
+    hardlink_db = HARDLINK_DB if os.path.exists(HARDLINK_DB) else None
+    paths = find_dat_files(
+        file_md5,
+        wechat_base_dir=WECHAT_BASE_DIR,
+        attach_dir=ATTACH_DIR,
+        msgattach_dir=MSGATTACH_DIR,
+        hardlink_db=hardlink_db,
+        username=username,
+    )
+    return select_best_dat_path(paths, file_md5, allow_thumbnail=True)
 
 
 def _detect_image_format(header):
@@ -229,105 +211,63 @@ def _decrypt_dat_to_bytes(dat_path):
 _resource_md5_map = _load_resource_md5_map() if _EXPORT_IMAGES else {}
 
 
-def decode_chat_images(chat_username, _messages_unused, out_dir):
-    """直接扫描 attach 目录下该联系人的全部图片并解密
-    按月份分目录输出到 out_dir/image/<YYYY-MM>/
-    跳过 _t 缩略图，优先 _h 高清版
-    返回 {file_md5: relative_path} 用于 HTML 嵌入
+def _month_from_dat_path(dat_path):
+    parts = dat_path.replace("\\", "/").split("/")
+    for i, part in enumerate(parts):
+        if part == "Img" and i > 0:
+            return parts[i - 1]
+        if part == "Image" and i + 1 < len(parts):
+            return parts[i + 1]
+    return "unknown"
+
+
+def decode_chat_images(chat_username, messages, out_dir):
+    """解密该联系人的图片：hardlink / attach 查找 + CDN 回退。
+
+    按月份分目录输出到 out_dir/image/<YYYY-MM>/。
+    返回 {file_md5: relative_path} 用于 HTML 嵌入。
     """
     image_map = {}
-    username_hash = hashlib.md5(chat_username.encode()).hexdigest()
+    md5_to_xml = {}
+    if messages:
+        for m in messages:
+            if m.get("type") != 3:
+                continue
+            lid = m.get("local_id")
+            file_md5 = _resource_md5_map.get((chat_username, lid))
+            if file_md5 and m.get("content"):
+                md5_to_xml.setdefault(file_md5, m["content"])
 
-    # 收集所有来源目录: [(base_path, sub_structure), ...]
-    # xwechat: attach/<hash>/<YYYY-MM>/Img/<md5>*.dat
-    # WeChat Files: MsgAttach/<hash>/Image/<YYYY-MM>/<md5>*.dat
-    source_dirs = []
-    if ATTACH_DIR:
-        p = os.path.join(ATTACH_DIR, username_hash)
-        if os.path.isdir(p):
-            source_dirs.append(("xwechat", p))
-    if MSGATTACH_DIR:
-        p = os.path.join(MSGATTACH_DIR, username_hash)
-        if os.path.isdir(p):
-            source_dirs.append(("wechat", p))
-
-    if not source_dirs:
+    md5_set = {md5 for (uname, _lid), md5 in _resource_md5_map.items() if uname == chat_username}
+    if not md5_set:
         return image_map
 
-    # 收集所有 dat 文件: {base_md5: (best_path, month)}
-    # 优先级: _h > 无后缀 > _W > 其他（跳过 _t）
-    file_candidates = {}  # base_md5 -> (priority, dat_path, month)
-
-    def _priority(fname):
-        """返回优先级数字，越小越好"""
-        base = fname.rsplit('.', 1)[0]
-        if base.endswith('_h'):
-            return 0  # 高清
-        if '_' not in base[-3:]:
-            return 1  # 无后缀原图
-        if base.endswith('_W'):
-            return 2
-        return 9  # 其他
-
-    for src_type, base_path in source_dirs:
-        # xwechat: <hash>/<YYYY-MM>/Img/  — 直接列 base_path 得到月份
-        # wechat:  <hash>/Image/<YYYY-MM>/ — 需要列 base_path/Image 得到月份
-        if src_type == "xwechat":
-            scan_base = base_path
-        else:
-            scan_base = os.path.join(base_path, "Image")
-        try:
-            months = sorted(os.listdir(scan_base))
-        except OSError:
-            continue
-        for month in months:
-            if src_type == "xwechat":
-                img_dir = os.path.join(base_path, month, "Img")
-            else:
-                img_dir = os.path.join(scan_base, month)
-            if not os.path.isdir(img_dir):
-                continue
-            try:
-                files = os.listdir(img_dir)
-            except OSError:
-                continue
-            for fname in files:
-                if not fname.endswith('.dat'):
-                    continue
-                # 跳过缩略图 _t.dat 和 _t_W.dat
-                base_no_ext = fname.rsplit('.', 1)[0]
-                if '_t' in base_no_ext.split('_'):
-                    continue
-                if base_no_ext.endswith('_t') or '_t_' in base_no_ext:
-                    continue
-                # 提取 base md5
-                base_md5 = base_no_ext.split('_')[0]
-                pri = _priority(fname)
-                existing = file_candidates.get(base_md5)
-                if not existing or pri < existing[0]:
-                    file_candidates[base_md5] = (pri, os.path.join(img_dir, fname), month)
-
-    if not file_candidates:
-        return image_map
-
-    decoded_count = 0
-    for base_md5, (pri, dat_path, month) in file_candidates.items():
+    for base_md5 in sorted(md5_set):
+        dat_path = _find_dat_file(chat_username, base_md5)
+        month = _month_from_dat_path(dat_path) if dat_path else "unknown"
         month_dir = os.path.join(out_dir, "image", month)
-        # 检查是否已解密
+
         existing = glob.glob(os.path.join(month_dir, f"{base_md5}.*"))
         if existing:
             rel = os.path.relpath(existing[0], out_dir).replace("\\", "/")
             image_map[base_md5] = rel
             continue
-        img_bytes, fmt = _decrypt_dat_to_bytes(dat_path)
-        if not img_bytes or fmt == 'bin':
+
+        img_bytes, fmt = None, None
+        if dat_path:
+            img_bytes, fmt = _decrypt_dat_to_bytes(dat_path)
+
+        if (not img_bytes or fmt == 'bin') and base_md5 in md5_to_xml:
+            img_bytes, fmt = download_image_from_message_xml(md5_to_xml[base_md5])
+
+        if not img_bytes or not fmt or fmt == 'bin':
             continue
+
         os.makedirs(month_dir, exist_ok=True)
         out_path = os.path.join(month_dir, f"{base_md5}.{fmt}")
         with open(out_path, 'wb') as f:
             f.write(img_bytes)
         image_map[base_md5] = f"image/{month}/{base_md5}.{fmt}"
-        decoded_count += 1
 
     return image_map
 
@@ -658,7 +598,10 @@ for chat_username, cdata in chat_data.items():
     # ── 解密图片（每个联系人只执行一次）────────────────────────────────────
     image_md5_map = {}
     if _EXPORT_IMAGES:
-        image_md5_map = decode_chat_images(chat_username, None, out_dir)
+        all_messages = []
+        for _db_name, msgs in cdata["db_messages"]:
+            all_messages.extend(msgs)
+        image_md5_map = decode_chat_images(chat_username, all_messages, out_dir)
         if image_md5_map:
             print(f"  图片解密: {len(image_md5_map)} 张 ({dname})")
 

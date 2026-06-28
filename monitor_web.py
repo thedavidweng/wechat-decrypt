@@ -18,7 +18,15 @@ from Crypto.Cipher import AES
 import urllib.parse
 import glob as glob_mod
 import zstandard as zstd
-from decode_image import extract_md5_from_packed_info, decrypt_dat_file, is_v2_format
+from decode_image import (
+    extract_md5_from_packed_info,
+    decrypt_dat_file,
+    is_v2_format,
+    find_dat_files,
+    download_image_from_message_xml,
+    write_decoded_image_bytes,
+    dat_file_priority,
+)
 from key_utils import get_key_info, strip_key_metadata
 
 _zstd_dctx = zstd.ZstdDecompressor()
@@ -40,6 +48,7 @@ DECRYPTED_SESSION = os.path.join(_cfg["decrypted_dir"], "session", "session.db")
 DECODED_IMAGE_DIR = _cfg.get("decoded_image_dir", os.path.join(os.path.dirname(os.path.abspath(__file__)), "decoded_images"))
 MONITOR_CACHE_DIR = os.path.join(_cfg["decrypted_dir"], "_monitor_cache")
 WECHAT_BASE_DIR = _cfg.get("wechat_base_dir", "")
+MSGATTACH_DIR = _cfg.get("msgattach_dir", "")
 IMAGE_AES_KEY = _cfg.get("image_aes_key")  # V2 格式 AES key (从微信内存提取)
 IMAGE_XOR_KEY = _cfg.get("image_xor_key", 0x88)  # XOR key
 
@@ -540,6 +549,7 @@ class SessionMonitor:
         # 2. 遍历候选 DB，找到包含该 timestamp 消息的那个
         table_name = f"Msg_{hashlib.md5(username.encode()).hexdigest()}"
         local_id = None
+        message_xml = None
         for db_key in db_keys:
             for _try in range(2):
                 msg_db_path = self.db_cache.get(db_key)
@@ -549,13 +559,15 @@ class SessionMonitor:
                     conn = sqlite3.connect(f"file:{msg_db_path}?mode=ro", uri=True)
                     # 微信4.0 图片的 local_type 可能是复合编码: (sub<<32)|3
                     row = conn.execute(f"""
-                        SELECT local_id FROM [{table_name}]
+                        SELECT local_id, message_content, WCDB_CT_message_content
+                        FROM [{table_name}]
                         WHERE (local_type = 3 OR (local_type > 4294967296 AND local_type % 4294967296 = 3))
                         AND create_time = ?
                     """, (timestamp,)).fetchone()
                     if not row:
                         row = conn.execute(f"""
-                            SELECT local_id FROM [{table_name}]
+                            SELECT local_id, message_content, WCDB_CT_message_content
+                            FROM [{table_name}]
                             WHERE (local_type = 3 OR (local_type > 4294967296 AND local_type % 4294967296 = 3))
                             AND ABS(create_time - ?) <= 3
                             ORDER BY ABS(create_time - ?) LIMIT 1
@@ -563,6 +575,16 @@ class SessionMonitor:
                     conn.close()
                     if row:
                         local_id = row[0]
+                        mc, mc_ct = row[1], row[2]
+                        if isinstance(mc, bytes):
+                            if mc_ct == 4:
+                                try:
+                                    mc = _zstd_dctx.decompress(mc).decode('utf-8', errors='replace')
+                                except Exception:
+                                    mc = mc.decode('utf-8', errors='replace')
+                            else:
+                                mc = mc.decode('utf-8', errors='replace')
+                        message_xml = mc
                     break
                 except Exception as e:
                     if 'malformed' in str(e) and _try == 0:
@@ -617,40 +639,22 @@ class SessionMonitor:
             print(f"  [img] 未找到 MD5: local_id={local_id} t={timestamp}", flush=True)
             return None
 
-        # 5. 查找 .dat 文件
+        # 5. 查找 .dat 文件 (hardlink.db → 会话目录 → 全局 attach)
+        hardlink_db = None
+        if self.db_cache:
+            hardlink_db = self.db_cache.get(os.path.join("hardlink", "hardlink.db"))
         attach_dir = os.path.join(WECHAT_BASE_DIR, "msg", "attach")
-        username_hash = hashlib.md5(username.encode()).hexdigest()
-        search_base = os.path.join(attach_dir, username_hash)
-
-        if not os.path.isdir(search_base):
-            print(f"  [img] attach 目录不存在: {search_base}", flush=True)
-            return None
-
-        pattern = os.path.join(search_base, "*", "Img", f"{file_md5}*.dat")
-        dat_files = sorted(glob_mod.glob(pattern))
-        if not dat_files:
-            print(f"  [img] 未找到 .dat: MD5={file_md5}", flush=True)
-            return None
-
-        # 分类 .dat 文件
-        # 优先级: 原图.dat(最大) > _h.dat > _W.dat > _t.dat(缩略图)
+        dat_files = find_dat_files(
+            file_md5,
+            wechat_base_dir=WECHAT_BASE_DIR,
+            attach_dir=attach_dir,
+            msgattach_dir=MSGATTACH_DIR,
+            hardlink_db=hardlink_db,
+            username=username,
+        )
         ranked = []
         for f in dat_files:
-            fname = os.path.basename(f).lower()
-            sz = os.path.getsize(f)
-            if '_t_' in fname:
-                rank = 5  # _t_W.dat 缩略图变体
-            elif '_t.' in fname:
-                rank = 4  # _t.dat 缩略图
-            elif '_w.' in fname:
-                rank = 2  # _W.dat (V2 可转 JPEG)
-            elif '_h.' in fname:
-                rank = 1  # 高清
-            elif fname == f"{file_md5}.dat".lower():
-                rank = 0  # 原图 (最优先)
-            else:
-                rank = 0
-            ranked.append((rank, sz, f))
+            ranked.append((dat_file_priority(f, file_md5), os.path.getsize(f), f))
         ranked.sort(key=lambda x: (x[0], -x[1]))
 
         # 6. 解密图片
@@ -703,6 +707,20 @@ class SessionMonitor:
             print(f"  [img] 解密成功: {os.path.basename(final)} ({size_kb:.0f}KB)", flush=True)
             return os.path.basename(final)
 
+        # 7. CDN 回退：本地只有缩略图或未下载原图时
+        if message_xml:
+            print(f"  [img] 尝试 CDN 下载原图...", flush=True)
+            cdn_bytes, cdn_fmt = download_image_from_message_xml(message_xml)
+            if cdn_bytes and cdn_fmt and cdn_fmt != 'bin':
+                final = write_decoded_image_bytes(cdn_bytes, out_base, cdn_fmt)
+                if final:
+                    size_kb = os.path.getsize(final) / 1024
+                    print(f"  [img] CDN 下载成功: {os.path.basename(final)} ({size_kb:.0f}KB)", flush=True)
+                    return os.path.basename(final)
+
+        if not dat_files:
+            print(f"  [img] 未找到 .dat 且 CDN 失败: MD5={file_md5}", flush=True)
+            return None
         print(f"  [img] 所有 .dat 均无法解密", flush=True)
         return '__v2_unsupported__'
 

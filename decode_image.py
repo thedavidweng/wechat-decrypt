@@ -22,6 +22,8 @@ import glob
 import hashlib
 import sqlite3
 import struct
+import re
+import urllib.request
 
 # V2 格式完整 magic (6 bytes)
 V2_MAGIC = b'\x07\x08\x56\x32'       # 前 4 字节用于快速检测
@@ -462,10 +464,314 @@ def extract_md5_from_packed_info(blob):
     return None
 
 
+# ─── .dat 路径解析 (hardlink.db + 全局 fallback) ─────────────────────────────
+
+_DAT_THUMB_MARKERS = ('_t.', '_t_')
+
+
+def dat_file_priority(fname, file_md5):
+    """返回优先级数字，越小越好。file_md5 用于识别无后缀原图。"""
+    base = os.path.basename(fname).lower()
+    md5 = file_md5.lower()
+    if base == f"{md5}.dat":
+        return 0
+    if '_t_' in base:
+        return 5
+    if '_t.' in base:
+        return 4
+    if '_w.' in base or '_w_' in base:
+        return 2
+    if '_h.' in base or '_h_' in base:
+        return 1
+    return 3
+
+
+def rank_dat_paths(paths, file_md5):
+    """按版本优先级 + 文件大小排序 .dat 路径，最优在前。"""
+    ranked = []
+    for path in paths:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        ranked.append((dat_file_priority(path, file_md5), -size, path))
+    ranked.sort()
+    return [p for _, _, p in ranked]
+
+
+def select_best_dat_path(paths, file_md5, allow_thumbnail=False):
+    """从候选 .dat 路径中选最优的一个。"""
+    ranked = rank_dat_paths(paths, file_md5)
+    if not ranked:
+        return None
+    if allow_thumbnail:
+        return ranked[0]
+    for path in ranked:
+        fname = os.path.basename(path).lower()
+        if not any(m in fname for m in _DAT_THUMB_MARKERS):
+            return path
+    return ranked[0]
+
+
+class HardlinkIndex:
+    """hardlink.db 索引：md5(username) 目录名 → msg/attach 下的 .dat 路径。"""
+
+    def __init__(self, hardlink_db_path, wechat_base_dir):
+        self._hardlink_db = hardlink_db_path
+        self._attach_root = os.path.join(wechat_base_dir, "msg", "attach")
+        self._dir_map = {}
+        self._ready = False
+        if hardlink_db_path and os.path.isfile(hardlink_db_path):
+            self._load(hardlink_db_path)
+
+    def _load(self, db_path):
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "dir2id" not in tables or "image_hardlink_info_v4" not in tables:
+                return
+            self._dir_map = dict(conn.execute("SELECT rowid, username FROM dir2id"))
+            self._ready = True
+        finally:
+            conn.close()
+
+    @property
+    def ready(self):
+        return self._ready
+
+    def lookup_dat_paths(self, file_md5):
+        """用 message_resource 的 MD5 前缀匹配 file_name，返回存在的 .dat 路径。"""
+        if not self._ready:
+            return []
+        conn = sqlite3.connect(f"file:{self._hardlink_db}?mode=ro", uri=True)
+        try:
+            rows = conn.execute(
+                "SELECT file_name, file_size, dir1, dir2 "
+                "FROM image_hardlink_info_v4 "
+                "WHERE file_name LIKE ?",
+                (f"{file_md5}%",),
+            ).fetchall()
+        finally:
+            conn.close()
+
+        paths = []
+        for fname, _fsize, dir1, dir2 in rows:
+            d1 = self._dir_map.get(dir1)
+            d2 = self._dir_map.get(dir2)
+            if not d1 or not d2:
+                continue
+            path = os.path.join(self._attach_root, d1, d2, "Img", fname)
+            if os.path.isfile(path):
+                paths.append(path)
+        return rank_dat_paths(paths, file_md5)
+
+
+def _glob_dat_under(base_dir, file_md5, depth=2):
+    """在 base_dir 下 glob .dat。depth=1: <hash>/Img; depth=2: <hash>/<month>/Img。"""
+    if not base_dir or not os.path.isdir(base_dir):
+        return []
+    results = []
+    if depth >= 2:
+        pattern = os.path.join(base_dir, "*", "*", "Img", f"{file_md5}*.dat")
+        results.extend(glob.glob(pattern))
+    if depth >= 1:
+        pattern = os.path.join(base_dir, "*", "Img", f"{file_md5}*.dat")
+        results.extend(glob.glob(pattern))
+    return list(dict.fromkeys(results))
+
+
+def find_dat_files(
+    file_md5,
+    *,
+    wechat_base_dir="",
+    attach_dir=None,
+    msgattach_dir=None,
+    hardlink_db=None,
+    username=None,
+):
+    """统一 .dat 查找：hardlink.db → 会话目录 → 全局 attach → MsgAttach。
+
+    参考 WeFlow imageDecryptService + hardlink.db 方案 (hicccc77/WeFlow#363)。
+    """
+    attach_dir = attach_dir or (
+        os.path.join(wechat_base_dir, "msg", "attach") if wechat_base_dir else ""
+    )
+    seen = set()
+    results = []
+
+    def _add(paths):
+        for path in paths:
+            if path not in seen:
+                seen.add(path)
+                results.append(path)
+
+    if wechat_base_dir and hardlink_db:
+        idx = HardlinkIndex(hardlink_db, wechat_base_dir)
+        if idx.ready:
+            _add(idx.lookup_dat_paths(file_md5))
+
+    if username and attach_dir:
+        chat_hash = hashlib.md5(username.encode()).hexdigest()
+        scoped = os.path.join(attach_dir, chat_hash)
+        _add(_glob_dat_under(scoped, file_md5, depth=1))
+
+    if attach_dir:
+        _add(_glob_dat_under(attach_dir, file_md5, depth=2))
+
+    if msgattach_dir and username:
+        chat_hash = hashlib.md5(username.encode()).hexdigest()
+        legacy_base = os.path.join(msgattach_dir, chat_hash, "Image")
+        if os.path.isdir(legacy_base):
+            pattern = os.path.join(legacy_base, "*", f"{file_md5}*.dat")
+            _add(glob.glob(pattern))
+
+    return rank_dat_paths(results, file_md5)
+
+
+# ─── CDN 原图下载 (消息 XML → cdnbigimgurl + aeskey) ─────────────────────────
+
+_CDN_HOST_PREFIXES = (
+    "http://wxapp.tc.qq.com/251203000/",
+    "https://wxapp.tc.qq.com/251203000/",
+    "http://wxapp.tc.qq.com/262203000/",
+    "https://wxapp.tc.qq.com/262203000/",
+)
+
+
+def extract_image_cdn_info(xml_text):
+    """从图片消息 XML 提取 CDN 字段。"""
+    if not xml_text:
+        return None
+    text = xml_text if isinstance(xml_text, str) else xml_text.decode("utf-8", "replace")
+
+    def _attr(name):
+        m = re.search(rf'\b{name}="([^"]*)"', text, re.IGNORECASE)
+        return m.group(1).strip() if m else ""
+
+    aes_key = _attr("aeskey")
+    big_url = _attr("cdnbigimgurl") or _attr("cdnurl")
+    mid_url = _attr("cdnmidimgurl")
+    thumb_url = _attr("cdnthumburl")
+    length_raw = _attr("length")
+    if not aes_key and not (big_url or mid_url or thumb_url):
+        return None
+    length = 0
+    if length_raw.isdigit():
+        length = int(length_raw)
+    return {
+        "aes_key": aes_key,
+        "big_url": big_url,
+        "mid_url": mid_url,
+        "thumb_url": thumb_url,
+        "length": length,
+    }
+
+
+def build_cdn_download_urls(cdn_token):
+    """把消息里的 CDN token / URL 变成可尝试的下载地址列表。"""
+    token = (cdn_token or "").strip()
+    if not token:
+        return []
+    if token.startswith("http://") or token.startswith("https://"):
+        return [token]
+    return [prefix + token for prefix in _CDN_HOST_PREFIXES]
+
+
+def decrypt_cdn_payload(data, aes_key_hex):
+    """解密微信 CDN 下发的 AES-128-CBC 图片数据 (IV = key[:16])。"""
+    if not data or not aes_key_hex:
+        return None
+    try:
+        from Crypto.Cipher import AES
+        from Crypto.Util import Padding
+        key = bytes.fromhex(aes_key_hex)
+        if len(key) < 16:
+            return None
+        cipher = AES.new(key[:16], AES.MODE_CBC, iv=key[:16])
+        plain = Padding.unpad(cipher.decrypt(data), AES.block_size)
+        return plain
+    except Exception:
+        return None
+
+
+def _decode_cdn_bytes(data, aes_key_hex):
+    """尝试把 CDN 响应解析成图片字节。"""
+    if not data:
+        return None
+    if aes_key_hex:
+        decrypted = decrypt_cdn_payload(data, aes_key_hex)
+        if decrypted and detect_image_format(decrypted[:16]) != 'bin':
+            return decrypted
+    if detect_image_format(data[:16]) != 'bin':
+        return data
+    return None
+
+
+def download_image_from_cdn(cdn_url, aes_key_hex=None, timeout=15):
+    """从 CDN 下载并解密图片，返回 (bytes, format) 或 (None, None)。"""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    for url in build_cdn_download_urls(cdn_url):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = resp.read()
+        except Exception:
+            continue
+        decoded = _decode_cdn_bytes(data, aes_key_hex)
+        if decoded:
+            return decoded, detect_image_format(decoded[:16])
+    return None, None
+
+
+def download_image_from_message_xml(xml_text, prefer_big=True):
+    """从图片消息 XML 选最优 CDN 源并下载，返回 (bytes, format) 或 (None, None)。"""
+    info = extract_image_cdn_info(xml_text)
+    if not info:
+        return None, None
+    aes_key = info.get("aes_key") or ""
+    candidates = []
+    if prefer_big:
+        candidates.extend([info.get("big_url"), info.get("mid_url")])
+    else:
+        candidates.extend([info.get("mid_url"), info.get("big_url")])
+    candidates.append(info.get("thumb_url"))
+    for token in candidates:
+        if not token:
+            continue
+        data, fmt = download_image_from_cdn(token, aes_key)
+        if data and fmt and fmt != 'bin':
+            return data, fmt
+    return None, None
+
+
+def write_decoded_image_bytes(data, out_path_base, fmt=None):
+    """把已解密的图片字节写到 out_path_base.<fmt>，返回最终路径。"""
+    if not data:
+        return None
+    fmt = fmt or detect_image_format(data[:16])
+    if fmt == 'bin':
+        return None
+    os.makedirs(os.path.dirname(out_path_base) or ".", exist_ok=True)
+    final_path = f"{out_path_base}.{fmt}"
+    tmp_path = f"{out_path_base}.tmp"
+    with open(tmp_path, "wb") as f:
+        f.write(data)
+    if os.path.exists(final_path):
+        os.unlink(final_path)
+    os.rename(tmp_path, final_path)
+    return final_path
+
+
 class ImageResolver:
     """封装从 local_id 到图片文件的完整解析链"""
 
-    def __init__(self, wechat_base_dir, decoded_image_dir, cache, aes_key=None, xor_key=0x88):
+    def __init__(self, wechat_base_dir, decoded_image_dir, cache, aes_key=None, xor_key=0x88,
+                 hardlink_db=None, msgattach_dir=None):
         """
         Args:
             wechat_base_dir: 微信数据根目录 (如 D:\\xwechat_files\\<wxid>)
@@ -473,6 +779,8 @@ class ImageResolver:
             cache: DBCache 实例，用于解密 message_resource.db
             aes_key: V2 格式的 AES key (16 字节 str/bytes)，None 表示不支持 V2 文件
             xor_key: XOR key (int, 默认 0x88)，用于 V2 文件的 XOR 段
+            hardlink_db: 解密后的 hardlink.db 路径 (可选)
+            msgattach_dir: WeChat Files/FileStorage/MsgAttach (可选, 3.x 遗留)
         """
         self.base_dir = wechat_base_dir
         self.attach_dir = os.path.join(wechat_base_dir, "msg", "attach")
@@ -480,6 +788,8 @@ class ImageResolver:
         self.cache = cache
         self.aes_key = aes_key
         self.xor_key = xor_key
+        self.hardlink_db = hardlink_db
+        self.msgattach_dir = msgattach_dir or ""
 
     def get_image_md5(self, username, local_id):
         """通过 (username, local_id) 查 message_resource.db 获取图片 MD5
@@ -523,25 +833,17 @@ class ImageResolver:
         return None
 
     def find_dat_files(self, username, file_md5):
-        """在 attach 目录下查找对应的 .dat 文件
+        """在 attach / hardlink / MsgAttach 下查找 .dat，优先高清版本。"""
+        return find_dat_files(
+            file_md5,
+            wechat_base_dir=self.base_dir,
+            attach_dir=self.attach_dir,
+            msgattach_dir=self.msgattach_dir,
+            hardlink_db=self.hardlink_db,
+            username=username,
+        )
 
-        路径: attach/<md5(username)>/<YYYY-MM>/Img/<file_md5>[_t|_h].dat
-        """
-        username_hash = hashlib.md5(username.encode()).hexdigest()
-        search_base = os.path.join(self.attach_dir, username_hash)
-
-        if not os.path.isdir(search_base):
-            return []
-
-        # 在所有月份目录下搜索
-        results = []
-        pattern = os.path.join(search_base, "*", "Img", f"{file_md5}*.dat")
-        for p in glob.glob(pattern):
-            results.append(p)
-
-        return sorted(results)
-
-    def decode_image(self, username, local_id):
+    def decode_image(self, username, local_id, message_xml=None):
         """完整流程：local_id → MD5 → .dat → 解密
 
         Returns:
@@ -552,49 +854,55 @@ class ImageResolver:
         if not file_md5:
             return {'success': False, 'error': f'无法从 message_resource.db 找到 {username} local_id={local_id} 的图片信息'}
 
-        # 2. 找 .dat 文件
+        out_path_base = os.path.join(self.out_dir, file_md5)
         dat_files = self.find_dat_files(username, file_md5)
-        if not dat_files:
-            return {'success': False, 'error': f'找不到 .dat 文件 (MD5={file_md5})', 'md5': file_md5}
 
-        # 优先选标准版（非 _t/_h），然后高清 _h，最后缩略图 _t
-        selected = dat_files[0]
-        for f in dat_files:
-            fname = os.path.basename(f)
-            if not fname.startswith(file_md5 + '_'):
-                selected = f
-                break
-        for f in dat_files:
-            if f.endswith('_h.dat'):
-                selected = f
-                break
+        # 2. 本地 .dat 解密
+        for selected in dat_files:
+            if is_v2_format(selected) and not self.aes_key:
+                continue
+            result_path, fmt = decrypt_dat_file(
+                selected, f"{out_path_base}.tmp", self.aes_key, self.xor_key,
+            )
+            if not result_path or not fmt or fmt == 'bin':
+                continue
+            final_path = f"{out_path_base}.{fmt}"
+            if os.path.exists(final_path):
+                os.unlink(final_path)
+            os.rename(result_path, final_path)
+            return {
+                'success': True,
+                'path': final_path,
+                'format': fmt,
+                'md5': file_md5,
+                'source': selected,
+                'size': os.path.getsize(final_path),
+            }
 
-        # 3. 解密 (decrypt_dat_file 会按 magic 自动分发 V2 / V1 / 老 XOR)
-        out_name = f"{file_md5}"
-        out_path_base = os.path.join(self.out_dir, out_name)
+        # 3. CDN 回退：本地只有缩略图或没有 .dat 时尝试下载原图
+        if message_xml:
+            cdn_bytes, cdn_fmt = download_image_from_message_xml(message_xml)
+            if cdn_bytes and cdn_fmt:
+                final_path = write_decoded_image_bytes(cdn_bytes, out_path_base, cdn_fmt)
+                if final_path:
+                    return {
+                        'success': True,
+                        'path': final_path,
+                        'format': cdn_fmt,
+                        'md5': file_md5,
+                        'source': 'cdn',
+                        'size': os.path.getsize(final_path),
+                    }
 
-        # 提前拦截以给出具体错误信息;否则会在 v2_decrypt_file 内 silent-fail 成笼统的"解密失败"
-        if is_v2_format(selected) and not self.aes_key:
-            return {'success': False, 'error': f'V2 格式 .dat 文件需要 AES key (文件: {selected})', 'md5': file_md5}
-
-        result_path, fmt = decrypt_dat_file(selected, f"{out_path_base}.tmp", self.aes_key, self.xor_key)
-        if not result_path:
-            return {'success': False, 'error': f'解密失败 (文件: {selected})', 'md5': file_md5}
-
-        # 重命名为正确扩展名
-        final_path = f"{out_path_base}.{fmt}"
-        if os.path.exists(final_path):
-            os.unlink(final_path)
-        os.rename(result_path, final_path)
-
-        return {
-            'success': True,
-            'path': final_path,
-            'format': fmt,
-            'md5': file_md5,
-            'source': selected,
-            'size': os.path.getsize(final_path),
-        }
+        if dat_files and is_v2_format(dat_files[0]) and not self.aes_key:
+            return {
+                'success': False,
+                'error': f'V2 格式 .dat 文件需要 AES key (文件: {dat_files[0]})',
+                'md5': file_md5,
+            }
+        if dat_files:
+            return {'success': False, 'error': f'解密失败 (文件: {dat_files[0]})', 'md5': file_md5}
+        return {'success': False, 'error': f'找不到 .dat 文件 (MD5={file_md5})', 'md5': file_md5}
 
     def list_chat_images(self, db_path, table_name, username, limit=20, start_ts=None, end_ts=None):
         """列出某个聊天中的所有图片消息
@@ -636,7 +944,7 @@ class ImageResolver:
             if file_md5:
                 dat_files = self.find_dat_files(username, file_md5)
                 if dat_files:
-                    info['dat_file'] = dat_files[0]
+                    info['dat_file'] = select_best_dat_path(dat_files, file_md5) or dat_files[0]
                     try:
                         info['size'] = os.path.getsize(dat_files[0])
                     except OSError:
