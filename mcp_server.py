@@ -188,10 +188,19 @@ class DBCache:
             pass
 
     def get(self, rel_key):
+        rel_path = rel_key.replace('\\', '/').replace('/', os.sep)
+        pre = os.path.join(DECRYPTED_DIR, rel_path)
+        if os.path.isfile(pre):
+            try:
+                with closing(sqlite3.connect(f"file:{pre}?mode=ro", uri=True)) as conn:
+                    conn.execute("SELECT 1").fetchone()
+                return pre
+            except sqlite3.DatabaseError:
+                pass
+
         key_info = get_key_info(ALL_KEYS, rel_key)
         if not key_info:
             return None
-        rel_path = rel_key.replace('\\', '/').replace('/', os.sep)
         db_path = os.path.join(DB_DIR, rel_path)
         wal_path = db_path + "-wal"
         if not os.path.exists(db_path):
